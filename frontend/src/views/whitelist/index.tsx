@@ -24,41 +24,38 @@ const statuses = [
   "已冻结",
   "已注销"
 ]
-const stats = [
-  {
-    "label": "来源登记总数",
-    "value": 0
-  },
-  {
-    "label": "已登记来源",
-    "value": 0
-  },
-  {
-    "label": "已冻结来源",
-    "value": 0
-  }
-]
 
-type Row = Record<string, string | number | null>
+type Row = Record<string, string | number | boolean | null>
+type Application = Record<string, string | number | string[]>
 
 export default function WhitelistView() {
   const [rows, setRows] = useState<Row[]>([])
   const [total, setTotal] = useState(0)
   const [errorMessage, setErrorMessage] = useState('')
+  const [noticeMessage, setNoticeMessage] = useState('')
   const [filters, setFilters] = useState<Record<string, string>>({})
-  const filterFields = useMemo(() => columns.slice(0, 3), [])
+  const [applications, setApplications] = useState<Application[]>([])
+  const filterFields = useMemo(() => [columns[0], columns[1]], [])
 
   const reload = useCallback(async () => {
     setErrorMessage('')
-    const query = new URLSearchParams(filters).toString()
+    // 页面筛选字段用中文列名，后端按 keyword/application/status 收口，这里显式映射。
+    const query = new URLSearchParams()
+    if (filters[columns[0]]) query.set('keyword', filters[columns[0]])
+    if (filters[columns[1]]) query.set('application', filters[columns[1]])
+    if (filters.status) query.set('status', filters.status)
     try {
-      const response = await request(`${ENDPOINT}?${query}`)
-      if (!response.ok) {
+      const [listResponse, appResponse] = await Promise.all([
+        request(`${ENDPOINT}?${query}`),
+        request(`${ENDPOINT}/applications`),
+      ])
+      if (!listResponse.ok) {
         throw new Error('来源登记列表读取失败')
       }
-      const payload = await response.json()
+      const payload = await listResponse.json()
       setRows(payload.items ?? [])
       setTotal(payload.total ?? 0)
+      if (appResponse.ok) setApplications((await appResponse.json()).items ?? [])
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '调用来源管理列表读取失败')
     }
@@ -70,26 +67,35 @@ export default function WhitelistView() {
 
   async function runAction(action: string, row: Row) {
     setErrorMessage('')
+    setNoticeMessage('')
     try {
       const response = await request(`${ENDPOINT}/${row.id}/actions`, {
         method: 'POST',
         body: JSON.stringify({ action }),
       })
-      if (!response.ok) {
-        throw new Error('调用来源管理动作未生效，请稍后重试')
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok || payload.ok === false) {
+        throw new Error(payload.message ?? '调用来源管理动作未生效，请稍后重试')
       }
+      setNoticeMessage(payload.message ?? '')
       await reload()
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '调用来源管理操作失败')
     }
   }
 
+  const selectedApplication = filters['应用名称'] ?? ''
+  const linkedTasks = applications.find((item) => item['应用名称'] === selectedApplication)?.['订阅任务']
+
   return (
     <section className="page" data-module="whitelist">
       <header className="page-head">
         <div>
           <h2>调用来源管理管理</h2>
-          <p className="page-desc">维护调用来源的标识登记、配额分配与有效期管理，为调用来源管理提供可审计的数据工程流程。</p>
+          <p className="page-desc">
+            维护调用来源的标识登记、配额分配与有效期。来源登记的应用名称与订阅任务的应用名称是同一引用键，
+            注销来源会同步停止该应用已有订阅任务的推送，并阻止继续新增推送。
+          </p>
         </div>
         <div className="page-actions">
           <button className="btn primary" type="button" onClick={() => setErrorMessage('来源登记登记入口尚未接入审批流')}>
@@ -100,15 +106,6 @@ export default function WhitelistView() {
           </button>
         </div>
       </header>
-
-      <div className="stat-row">
-        {stats.map((item) => (
-          <article key={item.label} className="stat-card">
-            <span className="stat-label">{item.label}</span>
-            <strong className="stat-value">{item.value}</strong>
-          </article>
-        ))}
-      </div>
 
       <form className="filter-bar" onSubmit={(event) => { event.preventDefault(); void reload() }}>
         {filterFields.map((field) => (
@@ -121,6 +118,16 @@ export default function WhitelistView() {
             />
           </label>
         ))}
+        <label className="filter-item">
+          <span>登记状态</span>
+          <select
+            value={filters.status ?? ''}
+            onChange={(event) => setFilters((prev) => ({ ...prev, status: event.target.value }))}
+          >
+            <option value="">全部状态</option>
+            {statuses.map((status) => <option key={status} value={status}>{status}</option>)}
+          </select>
+        </label>
         <button className="btn" type="submit">查询</button>
         <button className="btn ghost" type="button" onClick={() => setFilters({})}>重置条件</button>
       </form>
@@ -129,6 +136,7 @@ export default function WhitelistView() {
         <thead>
           <tr>
             {columns.map((column) => <th key={column}>{column}</th>)}
+            <th>关联订阅任务</th>
             <th>可执行动作</th>
           </tr>
         </thead>
@@ -136,6 +144,7 @@ export default function WhitelistView() {
           {rows.map((row) => (
             <tr key={String(row.id)}>
               {columns.map((column) => <td key={column}>{row[column] ?? '—'}</td>)}
+              <td>{row['关联订阅任务数'] ? `${row['关联订阅任务数']} 个（${row['关联订阅任务']}）` : '—'}</td>
               <td className="row-actions">
                 {actions.map((action) => (
                   <button key={action} className="link" type="button" onClick={() => void runAction(action, row)}>
@@ -147,14 +156,41 @@ export default function WhitelistView() {
           ))}
           {rows.length === 0 && (
             <tr>
-              <td className="empty-state" colSpan={columns.length + 1}>暂无调用来源管理数据，可先登记来源登记</td>
+              <td className="empty-state" colSpan={columns.length + 2}>暂无调用来源管理数据，可先登记来源登记</td>
             </tr>
           )}
         </tbody>
       </table>
 
+      <section className="panel">
+        <h3>订阅任务引用的应用名称</h3>
+        <p className="hint">
+          下列应用名称来自订阅任务清单；只有全部登记都已注销的应用才会阻止新增推送。选择应用可筛选来源登记。
+        </p>
+        <div className="filter-bar">
+          {applications.map((item) => (
+            <button
+              key={String(item['应用名称'])}
+              className="btn ghost"
+              type="button"
+              onClick={() => setFilters((prev) => ({ ...prev, 应用名称: String(item['应用名称']) }))}
+            >
+              {item['应用名称']}（{item['登记状态']}，订阅任务 {Array.isArray(item['订阅任务']) ? item['订阅任务'].length : 0}）
+            </button>
+          ))}
+          {applications.length === 0 && <span className="hint">暂无应用名称引用</span>}
+        </div>
+        {selectedApplication && (
+          <p className="hint">
+            已筛选应用「{selectedApplication}」
+            {Array.isArray(linkedTasks) && linkedTasks.length > 0 ? `，引用任务：${linkedTasks.join('、')}` : '，无订阅任务引用'}
+          </p>
+        )}
+      </section>
+
       <footer className="page-foot">
         <span>共 {total} 条调用来源管理记录</span>
+        {noticeMessage && <span className="ok-text">{noticeMessage}</span>}
         {errorMessage && <span className="error-text">{errorMessage}</span>}
       </footer>
     </section>
